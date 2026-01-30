@@ -132,12 +132,10 @@ class ImageDecoder(nn.Module):
 class TextualPromptLearner(nn.Module):
     def __init__(self, config, dtype, token_embedding):
         super().__init__()
-        with open(config.ann_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        categories = [c['name'] for c in data['categories']]
+        categories = config.categories
         num_category = len(categories)
 
-        n_ctx = config.MODEL.N_CTX
+        n_ctx = config.MODEL.N_CTX_C
         ctx_dim = config.MODEL.CTX_DIM
         ctx_vectors = torch.empty(num_category, n_ctx, ctx_dim, dtype=dtype)
         nn.init.normal_(ctx_vectors, std=0.02)
@@ -172,7 +170,7 @@ class VisualPromptLearner(nn.Module):
         dim = config.MODEL.DIM
         vision_width = config.MODEL.VISION_WIDTH
         scale = vision_width ** -0.5
-        self.prompt_vectors = nn.Parameter(scale * torch.randn(1, 1, dim, dtype=dtype))
+        self.prompt_vectors = nn.Parameter(scale * torch.randn(1, config.MODEL.N_CTX_L, dim, dtype=dtype))
         self.prompt_proj = nn.Linear(dim, vision_width)
         self.prompt_dropout = nn.Dropout(config.MODEL.DROPOUT)
 
@@ -183,48 +181,8 @@ class VisualPromptLearner(nn.Module):
         return prompt
 
 
-class AnchorGenerator(nn.Module):
-    def __init__(self, backbone):
-        super().__init__()
-        self.backbone = backbone
-        self.input_means = []
-        self.input_vars = []
-        self.bn_running_means = []
-        self.bn_running_vars = []
-        self.loss = nn.MSELoss()
-        self._register_bn_hooks()
-
-    def _register_bn_hooks(self):
-        for module in self.backbone.modules():
-            if isinstance(module, nn.BatchNorm2d):
-                module.register_forward_hook(self._statistic_forward_hook)
-
-    def _statistic_forward_hook(self, module, input, output):
-        input_tensor = input[0]
-        mean = input_tensor.mean(dim=[0, 2, 3])
-        var = input_tensor.var(dim=[0, 2, 3], unbiased=False)
-        self.input_means.append(mean)
-        self.input_vars.append(var)
-        self.bn_running_means.append(module.running_mean)
-        self.bn_running_vars.append(module.running_var)
-
-    def forward(self, y):
-        self.input_means.clear()
-        self.input_vars.clear()
-        self.bn_running_means.clear()
-        self.bn_running_vars.clear()
-        features = self.backbone(y)
-        _loss = torch.zeros(1, device=y.device)
-        num_bn_layers = len(self.bn_running_means)
-        for i in range(num_bn_layers):
-            _loss += self.loss(self.input_means[i], self.bn_running_means[i])
-            _loss += self.loss(self.input_vars[i], self.bn_running_vars[i])
-        anchor = _loss / num_bn_layers
-        return anchor
-
-
 class MPIQA(nn.Module):
-    def __init__(self, config, clip_model, backbone):
+    def __init__(self, config, clip_model):
         super().__init__()
         self.text_encoder = TextEncoder(clip_model)
         self.image_encoder = ImageEncoder(clip_model.visual)
@@ -232,22 +190,19 @@ class MPIQA(nn.Module):
         self.multimodal_decoder = MultiModalDecoder(config)
         self.textual_prompt_learner = TextualPromptLearner(config, clip_model.dtype, clip_model.token_embedding)
         self.visual_prompt_learner = VisualPromptLearner(config, clip_model.dtype)
-        self.anchor_generator = AnchorGenerator(backbone)
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
         self.textual = config.textual
         self.visual = config.visual
+        self.num_ctx_l = config.MODEL.N_CTX_L
 
     def train(self, mode=True):
         super().train(mode)
         self.image_encoder.eval()
         self.text_encoder.eval()
-        self.anchor_generator.eval()
         return self
 
     def forward(self, x, train_mode=False):
         if train_mode:
-            y = x
-            quality_anchor = self.anchor_generator(y)
             if self.textual and self.visual:
                 B = x.shape[0]
                 tp, tokenized_features = self.textual_prompt_learner()
@@ -256,37 +211,39 @@ class MPIQA(nn.Module):
 
                 vp = self.visual_prompt_learner()
                 x = self.image_encoder(x, vp)
-                cls_feature, visual_prompt, patch_feature = x[:, :1, :], x[:, 1:2, :], x[:, 2:, :]
+                cls_feature, visual_prompt, patch_feature = x[:, :1, :], x[:, 1:self.num_ctx_l+1, :], x[:, self.num_ctx_l+1:, :]
                 cls_feature = cls_feature / cls_feature.norm(dim=-1, keepdim=True)
                 visual_prompt = visual_prompt / visual_prompt.norm(dim=-1, keepdim=True)
                 patch_feature = patch_feature / patch_feature.norm(dim=-1, keepdim=True)
 
                 logit_scale = self.logit_scale.exp()
                 logits_category = logit_scale * torch.matmul(textual_prompt, cls_feature.permute(0, 2, 1)).squeeze(2)
-                logits_location = logit_scale * torch.matmul(visual_prompt, patch_feature.permute(0, 2, 1)).squeeze(1)
+                logits_location = logit_scale * torch.matmul(visual_prompt, patch_feature.permute(0, 2, 1))
+                logits_location = logits_location.mean(dim=1)
 
                 query = torch.cat([textual_prompt, visual_prompt], dim=1)
                 key_value = torch.cat([cls_feature, patch_feature], dim=1)
                 predict_score = self.multimodal_decoder(query, key_value)
 
-                return predict_score, quality_anchor, logits_category, logits_location
+                return predict_score, logits_category, logits_location
 
             elif self.visual:
                 vp = self.visual_prompt_learner()
                 x = self.image_encoder(x, vp)
-                cls_feature, visual_prompt, patch_feature = x[:, :1, :], x[:, 1:2, :], x[:, 2:, :]
+                cls_feature, visual_prompt, patch_feature = x[:, :1, :], x[:, 1:self.num_ctx_l+1, :], x[:, self.num_ctx_l+1:, :]
                 cls_feature = cls_feature / cls_feature.norm(dim=-1, keepdim=True)
                 visual_prompt = visual_prompt / visual_prompt.norm(dim=-1, keepdim=True)
                 patch_feature = patch_feature / patch_feature.norm(dim=-1, keepdim=True)
 
                 logit_scale = self.logit_scale.exp()
-                logits_location = logit_scale * torch.matmul(visual_prompt, patch_feature.permute(0, 2, 1)).squeeze(1)
+                logits_location = logit_scale * torch.matmul(visual_prompt, patch_feature.permute(0, 2, 1))
+                logits_location = logits_location.mean(dim=1)
 
                 query = visual_prompt
                 key_value = torch.cat([cls_feature, patch_feature], dim=1)
                 predict_score = self.multimodal_decoder(query, key_value)
 
-                return predict_score, quality_anchor, None, logits_location
+                return predict_score, None, logits_location
 
             elif self.textual:
                 B = x.shape[0]
@@ -306,13 +263,13 @@ class MPIQA(nn.Module):
                 key_value = torch.cat([cls_feature, patch_feature], dim=1)
                 predict_score = self.multimodal_decoder(query, key_value)
 
-                return predict_score, quality_anchor, logits_category, None
+                return predict_score, logits_category, None
 
             else:
                 x = self.image_encoder(x, None)
                 predict_score = self.image_decoder(x)
 
-                return predict_score, quality_anchor, None, None
+                return predict_score, None, None
 
         else:
             if self.textual and self.visual:
@@ -323,7 +280,7 @@ class MPIQA(nn.Module):
 
                 vp = self.visual_prompt_learner()
                 x = self.image_encoder(x, vp)
-                cls_feature, visual_prompt, patch_feature = x[:, :1, :], x[:, 1:2, :], x[:, 2:, :]
+                cls_feature, visual_prompt, patch_feature = x[:, :1, :], x[:, 1:self.num_ctx_l+1, :], x[:, self.num_ctx_l+1:, :]
                 cls_feature = cls_feature / cls_feature.norm(dim=-1, keepdim=True)
                 visual_prompt = visual_prompt / visual_prompt.norm(dim=-1, keepdim=True)
                 patch_feature = patch_feature / patch_feature.norm(dim=-1, keepdim=True)
@@ -337,7 +294,7 @@ class MPIQA(nn.Module):
             elif self.visual:
                 vp = self.visual_prompt_learner()
                 x = self.image_encoder(x, vp)
-                cls_feature, visual_prompt, patch_feature = x[:, :1, :], x[:, 1:2, :], x[:, 2:, :]
+                cls_feature, visual_prompt, patch_feature = x[:, :1, :], x[:, 1:self.num_ctx_l+1, :], x[:, self.num_ctx_l+1:, :]
                 cls_feature = cls_feature / cls_feature.norm(dim=-1, keepdim=True)
                 visual_prompt = visual_prompt / visual_prompt.norm(dim=-1, keepdim=True)
                 patch_feature = patch_feature / patch_feature.norm(dim=-1, keepdim=True)
@@ -370,4 +327,3 @@ class MPIQA(nn.Module):
                 predict_score = self.image_decoder(x)
 
                 return predict_score
-
