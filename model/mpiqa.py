@@ -94,6 +94,7 @@ class MultiModalDecoder(nn.Module):
         decoded_features = self.ln(decoded_features)
         decoded_features = self.mlp(decoded_features).squeeze(-1)
         score = torch.mean(decoded_features, dim=1)
+        score = torch.sigmoid(score)
         return score
 
 
@@ -126,6 +127,7 @@ class ImageDecoder(nn.Module):
         x = self.ln(x)
         decoded_features = self.mlp(x).squeeze(-1)
         score = torch.mean(decoded_features, dim=1)
+        score = torch.sigmoid(score)
         return score
 
 
